@@ -323,6 +323,13 @@ public static class MetadataResolver
                 if (matches.Count > 1 && callerIsCtor)
                     matches = matches.Where(c => c.Name == ".ctor").ToList();
 
+                if (matches.Count > 1 && receiver.IsThis)
+                {
+                    var byName = matches.Where(c => c.Name == method.Name).ToList();
+                    if (byName.Count == 1)
+                        matches = byName;
+                }
+
                 if (matches.Count > 1)
                     break;
 
