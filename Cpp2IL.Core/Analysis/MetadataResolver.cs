@@ -73,7 +73,7 @@ public static class MetadataResolver
             if (instruction.OpCode != OpCode.Move)
                 continue;
 
-            if (instruction.Operands[0] is not LocalVariable)
+            if (instruction.Operands[0] is not LocalVariable destLocal)
                 continue;
 
             var address = instruction.Operands[1] switch
@@ -86,12 +86,15 @@ public static class MetadataResolver
             if (address == 0)
                 continue;
 
-            // String literal.
-            var stringLiteral = libContext.GetLiteralByAddress(address);
-            if (stringLiteral != null)
+            // String literal: only valid if destination can hold a string
+            if (destLocal.Type?.FullName == "System.String" || (destLocal.Type == null && instruction.Operands[1] is not Immediate))
             {
-                instruction.SetOperand(1, new StringLiteral(stringLiteral));
-                continue;
+                var stringLiteral = libContext.GetLiteralByAddress(address);
+                if (stringLiteral != null && (destLocal.Type?.FullName == "System.String" || stringLiteral.Length > 0))
+                {
+                    instruction.SetOperand(1, new StringLiteral(stringLiteral));
+                    continue;
+                }
             }
 
             // Type metadata usage (Il2CppType* / Il2CppClass*).

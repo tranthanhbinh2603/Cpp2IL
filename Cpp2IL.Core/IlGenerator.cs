@@ -221,6 +221,21 @@ public static class IlGenerator
             instructions.Add(CilOpCodes.Ldstr, Diagnostic("Warning: " + warning));
             instructions.Add(CilOpCodes.Call, writeLine);
         }
+
+        // Ensure method body always ends with a valid terminator instruction
+        if (instructions.Count == 0 || !IsTerminator(instructions[^1]))
+        {
+            if (!context.IsVoid)
+                PushDefaultOf(context.ReturnType, instructions);
+            instructions.Add(CilOpCodes.Ret);
+        }
+    }
+
+    private static bool IsTerminator(CilInstruction instruction)
+    {
+        var code = instruction.OpCode.Code;
+        return code is CilCode.Ret or CilCode.Throw or CilCode.Rethrow
+            or CilCode.Br or CilCode.Br_S or CilCode.Leave or CilCode.Leave_S;
     }
 
     // Limit so we don't run into the 16mb limit (see AsmResolver issue #775)
@@ -472,6 +487,9 @@ public static class IlGenerator
             case OpCode.IndirectJump:
                 instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Indirect jump: {instruction.Operands[0]} (should have been resolved before IL gen)"));
                 instructions.Add(CilOpCodes.Call, writeLine);
+                if (!context.IsVoid)
+                    PushDefaultOf(context.ReturnType, instructions);
+                instructions.Add(CilOpCodes.Ret);
                 break;
 
             case OpCode.ShiftStack:
@@ -506,11 +524,18 @@ public static class IlGenerator
                 // Float arithmetic on a promoted integer operand needs an explicit conversion, so both
                 // operands are coerced to the (float) result type. A no-op when they already match.
                 var floatConversion = FloatArithmeticConversion(instruction);
+                var isNumericOp = instruction.OpCode is OpCode.Add or OpCode.Subtract or OpCode.Multiply
+                    or OpCode.Divide or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight
+                    or OpCode.And or OpCode.Or or OpCode.Xor;
 
-                LoadOperand(instruction.Operands[1], method, locals, writeLine);
+                var operandType = DestinationType(instruction.Operands[0]);
+                if (isNumericOp && (operandType == null || !operandType.IsValueType))
+                    operandType = context.AppContext.SystemTypes.SystemInt32Type;
+
+                LoadOperand(instruction.Operands[1], method, locals, writeLine, operandType);
                 if (floatConversion is { } conv1)
                     instructions.Add(conv1);
-                LoadOperand(instruction.Operands[2], method, locals, writeLine);
+                LoadOperand(instruction.Operands[2], method, locals, writeLine, operandType);
                 if (floatConversion is { } conv2)
                     instructions.Add(conv2);
 
@@ -656,7 +681,10 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldc_R8, d.Value);
                 break;
             case StringLiteral s:
-                instructions.Add(CilOpCodes.Ldstr, s.Value);
+                if (expectedType != null && expectedType.IsValueType)
+                    PushDefaultOf(expectedType, instructions);
+                else
+                    instructions.Add(CilOpCodes.Ldstr, s.Value);
                 break;
             case LocalVariable local:
                 LoadLocal(local, method, locals);
@@ -706,8 +734,15 @@ public static class IlGenerator
                 }
                 instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unmanaged memory load: " + operand));
                 instructions.Add(CilOpCodes.Call, writeLine);
-                instructions.Add(CilOpCodes.Ldc_I4_0);
-                instructions.Add(CilOpCodes.Conv_I);
+                if (expectedType != null)
+                {
+                    PushDefaultOf(expectedType, instructions);
+                }
+                else
+                {
+                    instructions.Add(CilOpCodes.Ldc_I4_0);
+                    instructions.Add(CilOpCodes.Conv_I);
+                }
                 break;
             case RuntimeMethodInfoAnalysisContext runtimeMethod:
                 // A delegate constructor takes its target as a native pointer, which is exactly ldftn.
@@ -718,8 +753,13 @@ public static class IlGenerator
                 }
 
                 //Not fully implemented, these basically shouldn't actually ever exist in the final IL.
-                instructions.Add(CilOpCodes.Ldc_I4_0);
-                instructions.Add(CilOpCodes.Conv_I);
+                if (expectedType != null)
+                    PushDefaultOf(expectedType, instructions);
+                else
+                {
+                    instructions.Add(CilOpCodes.Ldc_I4_0);
+                    instructions.Add(CilOpCodes.Conv_I);
+                }
                 break;
             case RuntimeFieldInfoAnalysisContext runtimeField:
                 // fieldof(F), e.g. the handle InitializeArray takes.
@@ -729,13 +769,23 @@ public static class IlGenerator
                     break;
                 }
 
-                instructions.Add(CilOpCodes.Ldc_I4_0);
-                instructions.Add(CilOpCodes.Conv_I);
+                if (expectedType != null)
+                    PushDefaultOf(expectedType, instructions);
+                else
+                {
+                    instructions.Add(CilOpCodes.Ldc_I4_0);
+                    instructions.Add(CilOpCodes.Conv_I);
+                }
                 break;
             case RuntimeClassTypeAnalysisContext or RgctxTableTypeAnalysisContext
                 or MethodRgctxTableTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext:
-                instructions.Add(CilOpCodes.Ldc_I4_0);
-                instructions.Add(CilOpCodes.Conv_I);
+                if (expectedType != null)
+                    PushDefaultOf(expectedType, instructions);
+                else
+                {
+                    instructions.Add(CilOpCodes.Ldc_I4_0);
+                    instructions.Add(CilOpCodes.Conv_I);
+                }
                 break;
             case TypeAnalysisContext type:
                 //typeof(T)
@@ -752,7 +802,10 @@ public static class IlGenerator
             default:
                 instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unknown operand: " + operand));
                 instructions.Add(CilOpCodes.Call, writeLine);
-                instructions.Add(CilOpCodes.Ldnull);
+                if (expectedType != null)
+                    PushDefaultOf(expectedType, instructions);
+                else
+                    instructions.Add(CilOpCodes.Ldnull);
                 break;
         }
     }
@@ -808,11 +861,11 @@ public static class IlGenerator
         return false;
     }
 
-    private static void PushDefaultOf(TypeAnalysisContext type, CilInstructionCollection instructions)
+    private static void PushDefaultOf(TypeAnalysisContext? type, CilInstructionCollection instructions)
     {
         //TODO Remove this, we should be handling arguments correctly in ISIL resolution, this is a hack to emit balanced stacks.
         //TODO At the *very* least we should emit a console.writeline saying that we did this.
-        if (!type.IsValueType)
+        if (type == null || !type.IsValueType)
         {
             instructions.Add(CilOpCodes.Ldnull);
             return;
