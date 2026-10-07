@@ -70,7 +70,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
     public List<string> AnalysisWarnings = [];
 
-    public static int MaxMethodSizeBytes = 30000; // 30KB
+    public static int MaxMethodSizeBytes = -1; 
 
     public List<ParameterAnalysisContext> Parameters = [];
 
