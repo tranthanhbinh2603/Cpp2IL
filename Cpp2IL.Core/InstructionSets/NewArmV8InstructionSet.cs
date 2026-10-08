@@ -121,6 +121,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     dataReferences.Add((ulong)((long)insn.Address + insn.Op1Imm));
                     break;
                 case Arm64Mnemonic.BL:
+                case Arm64Mnemonic.B when insn.MnemonicConditionCode is Arm64ConditionCode.NONE or Arm64ConditionCode.AL:
                     callTargets.Add(insn.BranchTarget);
                     break;
             }

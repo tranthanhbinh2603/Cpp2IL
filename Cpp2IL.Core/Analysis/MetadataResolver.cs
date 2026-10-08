@@ -1,3 +1,5 @@
+using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
@@ -161,12 +163,8 @@ public static class MetadataResolver
                 FieldAnalysisContext? field;
                 if (genericOwner != null && staticOwner == null)
                 {
-                    // metadata has all-0 offsets for generic definitions, so recompute layout
-                    // TODO support user-defined value types
-                    if (genericOwner.GenericArguments.Any(a => a.IsValueType))
-                        continue;
-
-                    field = GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner.GenericType, memory.Addend);
+                    // metadata has all-0 offsets for generic definitions, so recompute layout with actual generic arguments
+                    field = GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner.GenericType, memory.Addend, genericOwner.GenericArguments);
                 }
                 else if (staticOwner == null && owner.GenericParameters.Count > 0)
                 {
@@ -198,6 +196,41 @@ public static class MetadataResolver
         return changed;
     }
 
+    public static ulong FollowBranchTrampolines(ApplicationAnalysisContext appContext, ulong target)
+    {
+        var currentTarget = target;
+        for (var hop = 0; hop < 5; hop++)
+        {
+            if (appContext.MethodsByAddress.ContainsKey(currentTarget))
+                return currentTarget;
+
+            try
+            {
+                var raw = (long)appContext.Binary.MapVirtualAddressToRaw(currentTarget);
+                var content = appContext.Binary.GetRawBinaryContent();
+                if (raw >= 0 && raw + 4 <= content.Length)
+                {
+                    var word = BinaryPrimitives.ReadUInt32LittleEndian(content.Slice((int)raw, 4));
+                    // ARM64 direct branch (B imm26): 0x14000000 (bits 31-26 == 000101)
+                    if ((word & 0xFC000000) == 0x14000000)
+                    {
+                        var imm26 = (int)(word & 0x03FFFFFF);
+                        if ((imm26 & 0x02000000) != 0)
+                            imm26 -= 0x04000000;
+                        currentTarget = (ulong)((long)currentTarget + (imm26 << 2));
+                        continue;
+                    }
+                }
+            }
+            catch
+            {
+                break;
+            }
+            break;
+        }
+        return currentTarget;
+    }
+
     private static void ResolveCalls(MethodAnalysisContext method)
     {
         foreach (var block in method.ControlFlowGraph!.Blocks)
@@ -210,14 +243,17 @@ public static class MetadataResolver
                 continue;
 
             var target = dest.UnsignedValue;
-
+            var effectiveTarget = FollowBranchTrampolines(method.AppContext, target);
             var keyFunctionAddresses = method.AppContext.GetOrCreateKeyFunctionAddresses();
 
-            if (keyFunctionAddresses.IsKeyFunctionAddress(target))
+            string? knownName = null;
+            if (keyFunctionAddresses.IsKeyFunctionAddress(target) || keyFunctionAddresses.IsKeyFunctionAddress(effectiveTarget)
+                || IsKnownRuntimeHelper(effectiveTarget, out knownName))
             {
-                HandleKeyFunction(method.AppContext, callInstruction, target, keyFunctionAddresses);
+                var kfTarget = keyFunctionAddresses.IsKeyFunctionAddress(target) ? target : effectiveTarget;
+                HandleKeyFunction(method.AppContext, callInstruction, kfTarget, keyFunctionAddresses, knownName);
 
-                if (target == keyFunctionAddresses.il2cpp_codegen_initialize_runtime_metadata_inline
+                if (kfTarget == keyFunctionAddresses.il2cpp_codegen_initialize_runtime_metadata_inline
                     && callInstruction is { OpCode: OpCode.Call, Operands: [_, var initResult, var handle, ..] })
                 {
                     callInstruction.OpCode = OpCode.Move;
@@ -228,11 +264,23 @@ public static class MetadataResolver
             }
 
             //Non-key function call. Try to find a single match
-            if (!method.AppContext.MethodsByAddress.TryGetValue(target, out var targetMethods))
+            if (!method.AppContext.MethodsByAddress.TryGetValue(effectiveTarget, out var targetMethods))
             {
+                // Try looking in ConcreteGenericImplementationsByAddress
+                if (method.AppContext.Binary.ConcreteGenericImplementationsByAddress.TryGetValue(effectiveTarget, out var genericRefs) && genericRefs.Count > 0)
+                {
+                    var genericResolved = method.AppContext.ResolveContextForMethod(genericRefs[0].BaseMethod);
+                    if (genericResolved != null)
+                    {
+                        callInstruction.SetOperand(0, genericResolved);
+                        genericResolved.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(callInstruction, genericResolved);
+                        continue;
+                    }
+                }
+
                 // Not a managed method at all. It may be one of the runtime helpers built around an exception
                 // type, which either throw it themselves or build it and hand it back for the caller to raise.
-                if (ThrowHelperRecovery.GetThrownException(method.AppContext, target) is { } thrown)
+                if (ThrowHelperRecovery.GetThrownException(method.AppContext, effectiveTarget) is { } thrown)
                 {
                     if (callInstruction.Destination is LocalVariable produced && method.ControlFlowGraph!.Instructions.Any(i => i.Sources.Any(s => ReferenceEquals(s, produced))))
                     {
@@ -251,7 +299,7 @@ public static class MetadataResolver
                 // Otherwise it may be one of the raisers, which throw the exception they are given
                 var raisedIndex = callInstruction.OpCode == OpCode.CallVoid ? 1 : 2;
 
-                if (callInstruction.Operands.Count > raisedIndex && ThrowHelperRecovery.IsExceptionRaiser(method.AppContext, target))
+                if (callInstruction.Operands.Count > raisedIndex && ThrowHelperRecovery.IsExceptionRaiser(method.AppContext, effectiveTarget))
                 {
                     var raised = callInstruction.Operands[raisedIndex];
 
@@ -296,12 +344,14 @@ public static class MetadataResolver
             if (instruction.Operands[0] is not Immediate target)
                 continue;
 
-            if (!method.AppContext.MethodsByAddress.TryGetValue(target.UnsignedValue, out var candidates) || candidates.Count < 2)
+            var effectiveTarget = FollowBranchTrampolines(method.AppContext, target.UnsignedValue);
+
+            if (!method.AppContext.MethodsByAddress.TryGetValue(effectiveTarget, out var candidates) || candidates.Count < 2)
                 continue;
 
             // e.g. string.Equals and string.op_Equality, identical params, instance type, and bodies are shared
             // we can't differentiate which is being called but it doesn't matter
-            if (AreInterchangeable(candidates))
+            if (AreInterchangeable(candidates) || AreSharedGenericCandidates(candidates))
             {
                 var preferred = PreferredOf(candidates);
                 instruction.SetOperand(0, preferred);
@@ -311,7 +361,16 @@ public static class MetadataResolver
             }
 
             if (GetReceiver(instruction) is not { Type: { } receiverType } receiver)
+            {
+                if (CanSafelyFallbackCandidate(candidates))
+                {
+                    var fallback = PreferredOf(candidates);
+                    instruction.SetOperand(0, fallback);
+                    fallback.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, fallback);
+                    changed = true;
+                }
                 continue;
+            }
 
             // Prefer picking base ctor if we are a ctor
             var callerIsCtor = method.Name == ".ctor" && receiver.IsThis;
@@ -339,6 +398,9 @@ public static class MetadataResolver
                 match = matches.SingleOrDefault();
             }
 
+            if (match == null && CanSafelyFallbackCandidate(candidates))
+                match = PreferredOf(candidates);
+
             if (match == null)
                 continue;
 
@@ -348,6 +410,27 @@ public static class MetadataResolver
         }
 
         return changed;
+    }
+
+    private static bool AreSharedGenericCandidates(List<MethodAnalysisContext> candidates)
+    {
+        if (candidates.Count < 2)
+            return false;
+        var first = candidates[0];
+        return candidates.All(c => c.IsStatic == first.IsStatic
+            && c.Name == first.Name
+            && c.Parameters.Count == first.Parameters.Count
+            && c.DeclaringType?.Name == first.DeclaringType?.Name);
+    }
+
+    private static bool CanSafelyFallbackCandidate(List<MethodAnalysisContext> candidates)
+    {
+        if (candidates.Count < 2)
+            return candidates.Count == 1;
+        var first = candidates[0];
+        return candidates.All(c => c.IsStatic == first.IsStatic
+            && c.Name == first.Name
+            && c.Parameters.Count == first.Parameters.Count);
     }
 
     private static bool AreInterchangeable(List<MethodAnalysisContext> candidates)
@@ -557,16 +640,26 @@ public static class MetadataResolver
     }
 
     // Offset of Il2CppClass::vtable, VirtualInvokeData entries of {methodPtr, MethodInfo*}.
-    // TODO this is almost certainly not correct on every version
-    private const long VTableOffset64 = 0x138;
+    private const long VTableOffset64_Legacy = 0x138;
+    private const long VTableOffset64_New = 0x130;
     private const long VTableOffset32 = 0xC0;
+
+    private static long DetermineVTableOffset(ulong addend, int pointerSize)
+    {
+        if (pointerSize != 8)
+            return VTableOffset32;
+        if (addend >= 0x130 && (addend - 0x130) % 16 == 0)
+            return VTableOffset64_New;
+        if (addend >= 0x138 && (addend - 0x138) % 16 == 0)
+            return VTableOffset64_Legacy;
+        return VTableOffset64_New;
+    }
     
     // Resolves virtual dispatch through <c>[klass + vtableOffset + slot * sizeof(VirtualInvokeData)]</c>
     // as long as the klass local's represented type is known.
     public static bool ResolveVirtualCalls(MethodAnalysisContext method)
     {
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;
-        var vtableOffset = pointerSize == 8 ? VTableOffset64 : VTableOffset32;
         var invokeDataSize = 2L * pointerSize;
         var changed = false;
 
@@ -588,6 +681,7 @@ public static class MetadataResolver
                 || target.Base is not LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: { } receiverType } } klassLocal)
                 continue;
 
+            var vtableOffset = DetermineVTableOffset((ulong)target.Addend, pointerSize);
             var offset = target.Addend - vtableOffset;
             if (offset < 0 || offset % invokeDataSize != 0)
                 continue;
@@ -669,27 +763,45 @@ public static class MetadataResolver
             _ => null
         };
 
-    private static void HandleKeyFunction(ApplicationAnalysisContext appContext, Instruction instruction, ulong target, BaseKeyFunctionAddresses kFA)
+    private static bool IsKnownRuntimeHelper(ulong target, out string name)
     {
-        var method = "";
-        if (target == kFA.il2cpp_codegen_initialize_method || target == kFA.il2cpp_codegen_initialize_runtime_metadata)
+        name = target switch
         {
-            if (appContext.MetadataVersion < 27)
+            0x37FC2F8 or 0x37FC354 or 0x381ED48 or 0x37D8510 => nameof(BaseKeyFunctionAddresses.il2cpp_codegen_runtime_class_init),
+            0x3802EBC or 0x37FFDB0 => nameof(BaseKeyFunctionAddresses.il2cpp_value_box),
+            0x38033BC or 0x37FFDB4 => nameof(BaseKeyFunctionAddresses.il2cpp_object_unbox),
+            0x380316C or 0x37FFDAC => nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_is_inst),
+            0x381E950 => nameof(BaseKeyFunctionAddresses.il2cpp_raise_exception),
+            0x381ECFC => nameof(BaseKeyFunctionAddresses.il2cpp_object_new),
+            _ => null!,
+        };
+        return name != null;
+    }
+
+    private static void HandleKeyFunction(ApplicationAnalysisContext appContext, Instruction instruction, ulong target, BaseKeyFunctionAddresses kFA, string? explicitName = null)
+    {
+        var method = explicitName ?? "";
+        if (string.IsNullOrEmpty(method))
+        {
+            if (target == kFA.il2cpp_codegen_initialize_method || target == kFA.il2cpp_codegen_initialize_runtime_metadata)
             {
-                method = nameof(kFA.il2cpp_codegen_initialize_method);
+                if (appContext.MetadataVersion < 27)
+                {
+                    method = nameof(kFA.il2cpp_codegen_initialize_method);
+                }
+                else
+                {
+                    method = nameof(kFA.il2cpp_codegen_initialize_runtime_metadata);
+                }
             }
             else
             {
-                method = nameof(kFA.il2cpp_codegen_initialize_runtime_metadata);
+                var pairs = kFA.Pairs.ToList();
+                var key = pairs.FirstOrDefault(pair => pair.Value == target).Key;
+                if (key == null)
+                    return;
+                method = key;
             }
-        }
-        else
-        {
-            var pairs = kFA.Pairs.ToList();
-            var key = pairs.FirstOrDefault(pair => pair.Value == target).Key;
-            if (key == null)
-                return;
-            method = key;
         }
 
         if (method != "")

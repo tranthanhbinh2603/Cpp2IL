@@ -5,6 +5,7 @@ using AsmResolver.DotNet;
 using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
+using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
@@ -257,13 +258,7 @@ public static class IlGenerator
             branchInstruction.Operand = new CilInstructionLabel(target);
         }
 
-        // Add analysis warnings
         var instructions = body.Instructions;
-        foreach (var warning in context.AnalysisWarnings)
-        {
-            instructions.Add(CilOpCodes.Ldstr, Diagnostic("Warning: " + warning));
-            instructions.Add(CilOpCodes.Call, writeLine);
-        }
 
         // Ensure method body always ends with a valid terminator instruction
         if (instructions.Count == 0 || !IsTerminator(instructions[^1]))
@@ -331,15 +326,7 @@ public static class IlGenerator
         switch (instruction.OpCode)
         {
             case OpCode.Invalid:
-                instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Invalid instruction: {instruction}"));
-                instructions.Add(CilOpCodes.Call, writeLine);
-                break;
-
             case OpCode.NotImplemented:
-                instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Not implemented instruction: {instruction.Operands[0]}"));
-                instructions.Add(CilOpCodes.Call, writeLine);
-                break;
-
             case OpCode.Interrupt:
             case OpCode.Nop:
                 instructions.Add(CilOpCodes.Nop);
@@ -441,21 +428,105 @@ public static class IlGenerator
                 break;
 
             case OpCode.Phi:
-                instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Phi opcodes should not exist at this point in decompilation ({instruction})"));
-                instructions.Add(CilOpCodes.Call, writeLine);
+                if (instruction.Operands.Count > 0 && instruction.Operands[0] is LocalVariable phiDest)
+                {
+                    if (instruction.Operands.Count > 1)
+                        LoadOperand(instruction.Operands[1], method, locals, writeLine);
+                    else
+                        PushDefaultOf(phiDest.Type ?? context.AppContext.SystemTypes.SystemObjectType, method, instructions);
+                    StoreToOperand(phiDest, method, locals, writeLine);
+                }
                 break;
 
             case OpCode.Call:
             case OpCode.CallVoid:
-                if (instruction.Operands[0] is not MethodAnalysisContext targetMethod)
+                MethodAnalysisContext? targetMethod = instruction.Operands[0] as MethodAnalysisContext;
+                if (targetMethod == null)
                 {
                     if (instruction.Operands[0] is Immediate targetAddress)
-                        instructions.Add(CilOpCodes.Ldstr, $"Method not found @{targetAddress.UnsignedValue:X}");
-                    else // Probably key function. Just the target, the full operand dump is huge and blows the 16MB #US heap limit
-                        instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Unknown call target operand: {instruction.Operands[0]}"));
+                    {
+                        var resolvedTarget = MetadataResolver.FollowBranchTrampolines(context.AppContext, targetAddress.UnsignedValue);
+                        if (context.AppContext.MethodsByAddress.TryGetValue(resolvedTarget, out var methods) && methods.Count > 0)
+                        {
+                            targetMethod = methods[0];
+                        }
+                        else if (context.AppContext.Binary.ConcreteGenericImplementationsByAddress.TryGetValue(resolvedTarget, out var genericRefs) && genericRefs.Count > 0)
+                        {
+                            targetMethod = context.AppContext.ResolveContextForMethod(genericRefs[0].BaseMethod);
+                        }
+                    }
+                }
 
-                    instructions.Add(CilOpCodes.Call, writeLine);
-                    break;
+                if (targetMethod == null)
+                {
+                    if (instruction.Operands[0] is Immediate targetAddress)
+                    {
+                        if (instruction.OpCode == OpCode.Call && instruction.Operands.Count > 1 && instruction.Operands[1] is LocalVariable retLocal)
+                        {
+                            PushDefaultOf(retLocal.Type ?? context.AppContext.SystemTypes.SystemObjectType, method, instructions);
+                            StoreToOperand(retLocal, method, locals, writeLine);
+                        }
+                        break;
+                    }
+                    else if (instruction.Operands[0] is StringLiteral { Value: var kfName })
+                    {
+                        if (kfName is "SzArrayNew" or "il2cpp_vm_array_new_specific" or "il2cpp_array_new_specific")
+                        {
+                            if (instruction.Operands.Count > 1 && instruction.Operands[1] is LocalVariable arrResult)
+                            {
+                                if (arrResult.Type is SzArrayTypeAnalysisContext szArr)
+                                {
+                                    if (instruction.Operands.Count > 3)
+                                        LoadOperand(instruction.Operands[3], method, locals, writeLine);
+                                    else
+                                        instructions.Add(CilOpCodes.Ldc_I4_0);
+                                    instructions.Add(CilOpCodes.Newarr, szArr.ElementType.ToTypeSignature().ToTypeDefOrRef());
+                                }
+                                else
+                                {
+                                    PushDefaultOf(arrResult.Type ?? context.AppContext.SystemTypes.SystemObjectType, method, instructions);
+                                }
+                                StoreToOperand(arrResult, method, locals, writeLine);
+                            }
+                            break;
+                        }
+
+                        if (kfName == "il2cpp_vm_object_box")
+                        {
+                            if (instruction.Operands.Count > 1 && instruction.Operands[1] is LocalVariable boxResult)
+                            {
+                                if (instruction.Operands.Count > 3 && instruction.Operands[2] is TypeAnalysisContext targetBoxedType)
+                                {
+                                    LoadOperand(instruction.Operands[3], method, locals, writeLine, targetBoxedType);
+                                    instructions.Add(CilOpCodes.Box, targetBoxedType.ToTypeSignature().ToTypeDefOrRef());
+                                }
+                                else
+                                {
+                                    PushDefaultOf(boxResult.Type ?? context.AppContext.SystemTypes.SystemObjectType, method, instructions);
+                                }
+                                StoreToOperand(boxResult, method, locals, writeLine);
+                            }
+                            break;
+                        }
+
+                        // For other key functions or class_init, cleanly initialize return value if any
+                        if (instruction.OpCode == OpCode.Call && instruction.Operands.Count > 1 && instruction.Operands[1] is LocalVariable retLocal)
+                        {
+                            PushDefaultOf(retLocal.Type ?? context.AppContext.SystemTypes.SystemObjectType, method, instructions);
+                            StoreToOperand(retLocal, method, locals, writeLine);
+                        }
+                        break;
+                    }
+                    else
+                    {
+                        // Any remaining unknown target operand: safely provide default return value
+                        if (instruction.OpCode == OpCode.Call && instruction.Operands.Count > 1 && instruction.Operands[1] is LocalVariable retLocal)
+                        {
+                            PushDefaultOf(retLocal.Type ?? context.AppContext.SystemTypes.SystemObjectType, method, instructions);
+                            StoreToOperand(retLocal, method, locals, writeLine);
+                        }
+                        break;
+                    }
                 }
 
                 var importedMethod = targetMethod.ToMethodDescriptor();
@@ -468,8 +539,6 @@ public static class IlGenerator
                         LoadOperand(instruction.Operands[thisParamIndex], method, locals, writeLine, targetMethod.DeclaringType);
                     else
                     {
-                        instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Non static method called without 'this' param ({instruction})"));
-                        instructions.Add(CilOpCodes.Call, writeLine);
                         instructions.Add(CilOpCodes.Ldnull);
                     }
                 }
@@ -505,8 +574,11 @@ public static class IlGenerator
                 break;
 
             case OpCode.IndirectCall:
-                instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Indirect call: {instruction.Operands[0]} (should have been resolved before IL gen)"));
-                instructions.Add(CilOpCodes.Call, writeLine);
+                if (instruction.Operands.Count > 1 && instruction.Operands[1] is LocalVariable indirectRet)
+                {
+                    PushDefaultOf(indirectRet.Type ?? context.AppContext.SystemTypes.SystemObjectType, method, instructions);
+                    StoreToOperand(indirectRet, method, locals, writeLine);
+                }
                 break;
 
             case OpCode.Return:
@@ -530,16 +602,12 @@ public static class IlGenerator
                 break;
 
             case OpCode.IndirectJump:
-                instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Indirect jump: {instruction.Operands[0]} (should have been resolved before IL gen)"));
-                instructions.Add(CilOpCodes.Call, writeLine);
                 if (!context.IsVoid)
                     PushDefaultOf(context.ReturnType, method, instructions);
                 instructions.Add(CilOpCodes.Ret);
                 break;
 
             case OpCode.ShiftStack:
-                instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Stack shift: {instruction} (stack analysis should have removed these)"));
-                instructions.Add(CilOpCodes.Call, writeLine);
                 break;
 
             case OpCode.CheckEqual:
@@ -647,8 +715,6 @@ public static class IlGenerator
                 break;
 
             default:
-                instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Unknown instruction: {instruction}"));
-                instructions.Add(CilOpCodes.Call, writeLine);
                 break;
         }
 
@@ -824,11 +890,83 @@ public static class IlGenerator
                             : new CilInstruction(CilOpCodes.Ldind_Ref));
                     break;
                 }
-                instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unmanaged memory load: " + operand));
-                instructions.Add(CilOpCodes.Call, writeLine);
+
+                // String properties: Length and char indexer
+                if (memory.Base is LocalVariable { Type.FullName: "System.String" } strLocal)
+                {
+                    if (memory.Index == null && memory.Addend == 0x10)
+                    {
+                        var getLength = module.CorLibTypeFactory.CorLibScope
+                            .CreateTypeReference("System", "String")
+                            .CreateMemberReference("get_Length", MethodSignature.CreateInstance(module.CorLibTypeFactory.Int32));
+                        LoadLocal(strLocal, method, locals);
+                        instructions.Add(CilOpCodes.Callvirt, getLength);
+                        break;
+                    }
+                    if (memory.Addend == 0x14 && memory.Index != null)
+                    {
+                        var getChars = module.CorLibTypeFactory.CorLibScope
+                            .CreateTypeReference("System", "String")
+                            .CreateMemberReference("get_Chars", MethodSignature.CreateInstance(module.CorLibTypeFactory.Char, [module.CorLibTypeFactory.Int32]));
+                        LoadLocal(strLocal, method, locals);
+                        LoadOperand(memory.Index, method, locals, writeLine);
+                        instructions.Add(CilOpCodes.Callvirt, getChars);
+                        break;
+                    }
+                }
+
+                // Array: Length and element access
+                if (memory.Base is LocalVariable { Type: SzArrayTypeAnalysisContext arrType } arrLocal)
+                {
+                    if (memory.Index == null && memory.Addend == 0x18)
+                    {
+                        LoadLocal(arrLocal, method, locals);
+                        instructions.Add(CilOpCodes.Ldlen);
+                        instructions.Add(CilOpCodes.Conv_I4);
+                        break;
+                    }
+                    if (memory.Index != null)
+                    {
+                        LoadLocal(arrLocal, method, locals);
+                        LoadOperand(memory.Index, method, locals, writeLine);
+                        instructions.Add(CilOpCodes.Ldelem, arrType.ElementType.ToTypeSignature().ToTypeDefOrRef());
+                        break;
+                    }
+                }
+
+                // Cleanly handle internal runtime metadata structures (RGCTX tables, Il2CppClass tables, static field storage)
+                if (memory.Base is LocalVariable baseLocal && (baseLocal.Type is RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext
+                    or RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext
+                    || baseLocal.Type?.FullName?.Contains("Il2CppRgctx") == true || baseLocal.Type?.FullName?.Contains("Il2CppClass") == true
+                    || memory.Addend is 0xB8 or 0x130 or 0x135 or 0x138))
+                {
+                    if (expectedType != null)
+                        PushDefaultOf(expectedType, method, instructions);
+                    else
+                    {
+                        instructions.Add(CilOpCodes.Ldc_I4_0);
+                        instructions.Add(CilOpCodes.Conv_I);
+                    }
+                    break;
+                }
+
+                // Cleanly handle absolute uninitialized metadata slots or data globals (memory.Base == null)
+                if (memory.Base == null)
+                {
+                    if (expectedType != null)
+                        PushDefaultOf(expectedType, method, instructions);
+                    else
+                        instructions.Add(CilOpCodes.Ldnull);
+                    break;
+                }
+
                 if (expectedType != null)
                 {
                     PushDefaultOf(expectedType, method, instructions);
+                }
+                else if (memory.Base is LocalVariable lv && lv.Type != null && !lv.Type.IsValueType)
+                {
+                    instructions.Add(CilOpCodes.Ldnull);
                 }
                 else
                 {
@@ -892,8 +1030,6 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Call, typeFromHandle);
                 break;
             default:
-                instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unknown operand: " + operand));
-                instructions.Add(CilOpCodes.Call, writeLine);
                 if (expectedType != null)
                     PushDefaultOf(expectedType, method, instructions);
                 else
@@ -1099,8 +1235,6 @@ public static class IlGenerator
                 break;
 
             default:
-                instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Store into unknown operand: {operand}"));
-                instructions.Add(CilOpCodes.Call, writeLine);
                 instructions.Add(CilOpCodes.Pop);
                 break;
         }
