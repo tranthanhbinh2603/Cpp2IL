@@ -5,7 +5,9 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
+using AsmResolver;
 using AsmResolver.DotNet;
 using AsmResolver.DotNet.Builder;
 using AsmResolver.PE.Builder;
@@ -46,31 +48,45 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
         var ret = BuildAssemblies(context);
 
         var start = DateTime.Now;
-        Logger.Verbose("Generating PE images...", "DllOutput");
+        Logger.InfoNewline($"Generating and writing {ret.Count} assembly PE images to disk...", "DllOutput");
 
         if (!Directory.Exists(outputRoot))
             Directory.CreateDirectory(outputRoot);
 
-        //Convert assembly definitions to PE files
-        var peImagesToWrite = ret
-            .AsParallel()
-            .Select(a => (image: a.ManifestModule!.ToPEImage(new ManagedPEImageBuilder()), name: a.ManifestModule.Name!))
-            .ToList();
-
-        Logger.VerboseNewline($"{(DateTime.Now - start).TotalMilliseconds:F1}ms", "DllOutput");
-
-        start = DateTime.Now;
-        Logger.Verbose("Building and writing managed PE files to disk...", "DllOutput");
-
-        //Save them
+        //Convert assembly definitions to PE files and write them to disk
         var fileBuilder = new ManagedPEFileBuilder();
-        foreach (var (image, name) in peImagesToWrite)
+        var imageBuilder = new ManagedPEImageBuilder(EmptyErrorListener.Instance);
+
+        var asmIdx = 0;
+        foreach (var assembly in ret)
         {
-            var dllPath = Path.Combine(outputRoot, name);
-            fileBuilder.CreateFile(image).Write(dllPath);
+            if (assembly.ManifestModule is not { } module)
+                continue;
+
+            var name = module.Name;
+            if (string.IsNullOrEmpty(name))
+                continue;
+
+            asmIdx++;
+            try
+            {
+                var asmStart = DateTime.Now;
+                var image = module.ToPEImage(imageBuilder);
+                var dllPath = Path.Combine(outputRoot, name);
+                fileBuilder.CreateFile(image).Write(dllPath);
+                var elapsedMs = (DateTime.Now - asmStart).TotalMilliseconds;
+                if (elapsedMs > 500 || asmIdx % 20 == 0 || asmIdx == ret.Count)
+                {
+                    Logger.InfoNewline($"   [{asmIdx}/{ret.Count}] Saved {name} ({elapsedMs:F0}ms)...", "DllOutput");
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.WarnNewline($"Failed to write PE image for {name}: {ex.Message}", "DllOutput");
+            }
         }
 
-        Logger.VerboseNewline($"{(DateTime.Now - start).TotalMilliseconds:F1}ms", "DllOutput");
+        Logger.InfoNewline($"Finished writing PE images in {(DateTime.Now - start).TotalSeconds:F1}s", "DllOutput");
 
         if (TotalMethodCount != 0)
         {
@@ -156,6 +172,12 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
             }
         }
 
+        var total = work.Count;
+        var completed = 0;
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        long lastReportTicks = 0;
+        var reportLock = new object();
+
         void FillOne((TypeAnalysisContext Type, MethodAnalysisContext Method) pair)
         {
             var (typeContext, methodCtx) = pair;
@@ -167,6 +189,22 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
                 var managedMethod = methodCtx.GetExtraData<MethodDefinition>("AsmResolverMethod") ?? throw new($"AsmResolver method not found in method analysis context for {typeContext.FullName}.{methodCtx.Name}");
 
                 FillMethodBody(managedMethod, methodCtx);
+
+                var done = Interlocked.Increment(ref completed);
+                var now = stopwatch.ElapsedMilliseconds;
+                if (done == total || done % 5000 == 0 || (now - Volatile.Read(ref lastReportTicks) >= 5000))
+                {
+                    lock (reportLock)
+                    {
+                        if (done == total || done % 5000 == 0 || (now - lastReportTicks >= 5000))
+                        {
+                            lastReportTicks = now;
+                            var elapsedSec = Math.Max(0.1, now / 1000.0);
+                            var rate = done / elapsedSec;
+                            Logger.InfoNewline($"Decompiled {done}/{total} methods ({(done * 100.0 / total):F1}%) [{rate:F0} methods/s, {elapsedSec:F0}s elapsed]...", "DllOutput");
+                        }
+                    }
+                }
             }
 #if !DEBUG
             catch (System.Exception e)

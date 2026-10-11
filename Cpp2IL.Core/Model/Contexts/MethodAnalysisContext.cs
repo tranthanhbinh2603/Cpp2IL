@@ -373,13 +373,41 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         StackAnalyzer.Analyze(this);
 
+        var blockCount = ControlFlowGraph.Blocks.Count;
+        var isHeavyMethod = blockCount > 1000;
+
+        if (blockCount > 25000)
+        {
+            Logger.WarnNewline($"Method {FullName} has {blockCount} blocks, which exceeds absolute limits (>25,000). Filling with clean stub to avoid crash.");
+            ConvertedIsil = [];
+            return;
+        }
+
+        var methodSw = isHeavyMethod ? System.Diagnostics.Stopwatch.StartNew() : null;
+        System.Threading.Timer? heartbeatTimer = null;
+        if (isHeavyMethod)
+        {
+            Logger.InfoNewline($"[Large Method] Analyzing {FullName} ({blockCount:N0} blocks, {ConvertedIsil.Count:N0} instructions)...");
+            heartbeatTimer = new System.Threading.Timer(_ =>
+            {
+                if (methodSw != null && methodSw.IsRunning)
+                {
+                    Logger.InfoNewline($"   [Heartbeat] Still processing {Name} ({methodSw.ElapsedMilliseconds / 1000.0:F0}s elapsed, {ControlFlowGraph?.Blocks.Count} blocks)...");
+                }
+            }, null, 5000, 5000);
+        }
+
         // Dominator info must be computed after stack analysis, which removes unreachable/empty
         // blocks and would otherwise leave the dominator tree out of sync with the graph SSA sees.
         DominatorInfo = new DominatorInfo(ControlFlowGraph);
+        if (isHeavyMethod)
+            Logger.InfoNewline($"   [1/5] Dominators computed for {blockCount:N0} blocks ({methodSw!.ElapsedMilliseconds:N0}ms)");
 
         // Create locals
         SsaForm.Build(this);
         LocalVariables.CreateAll(this);
+        if (isHeavyMethod)
+            Logger.InfoNewline($"   [2/5] SSA Form built ({Locals.Count:N0} locals, {methodSw!.ElapsedMilliseconds:N0}ms)");
 
         // Fold the explicit per-comparison flag arithmetic back into single relational comparisons,
         // then eliminate the now-dead flag computations. Both run in SSA form, where each
@@ -407,6 +435,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         InterfaceDispatchRecovery.Run(this);
 
         LocalVariables.ResolveTypesAndFields(this);
+        if (isHeavyMethod)
+            Logger.InfoNewline($"   [3/5] Types and fields resolved ({methodSw!.ElapsedMilliseconds:N0}ms)");
 
         // Needs the MethodInfo* receivers typed, so runs after resolution unlike the class-init guards
         MetadataInitGuardRemover.RunRgctx(this);
@@ -438,12 +468,15 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // several definitions merging at a join here, so this pass propagates conservatively), then
         // drop dead locals.
         Simplifier.Simplify(this);
+        if (isHeavyMethod)
+            Logger.InfoNewline($"   [4/5] SSA destructed & variables coalesced ({methodSw!.ElapsedMilliseconds:N0}ms)");
 
         // Fix float literals
         FloatLiteralRecovery.Run(this);
 
         // Runs late so the array type and length reach the allocation call as operands after copy propagation has inlined them
         ArrayRecovery.Run(this);
+        DeadCodeEliminator.Run(this);
 
         LocalVariables.TypeAddressedLocals(this);
 
@@ -458,6 +491,14 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         DeadCodeEliminator.Run(this);
 
         LocalVariables.RemoveUnused(this);
+
+        heartbeatTimer?.Dispose();
+        if (isHeavyMethod)
+        {
+            Logger.InfoNewline($"   [5/5] Analysis finished ({ControlFlowGraph.Instructions.Count:N0} final ISIL instructions, {methodSw!.ElapsedMilliseconds / 1000.0:F1}s total)");
+            // Low-memory cleanup immediately after finishing a heavy method
+            GC.Collect(2, GCCollectionMode.Forced, false);
+        }
     }
 
     public void AddWarning(string warning) => AnalysisWarnings.Add(warning);
