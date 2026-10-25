@@ -265,6 +265,13 @@ public static class IlGenerator
             }
         }
 
+        // Add analysis warnings
+        foreach (var warning in context.AnalysisWarnings)
+        {
+            instructions.Add(CilOpCodes.Ldstr, Diagnostic("Warning: " + warning));
+            instructions.Add(CilOpCodes.Call, writeLine);
+        }
+
         // Ensure method body always ends with a valid terminator instruction
         if (instructions.Count == 0 || !IsTerminator(instructions[^1]))
         {
@@ -331,7 +338,15 @@ public static class IlGenerator
         switch (instruction.OpCode)
         {
             case OpCode.Invalid:
+                instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Invalid instruction: {instruction}"));
+                instructions.Add(CilOpCodes.Call, writeLine);
+                break;
+
             case OpCode.NotImplemented:
+                instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Not implemented instruction: {instruction.Operands[0]}"));
+                instructions.Add(CilOpCodes.Call, writeLine);
+                break;
+
             case OpCode.Interrupt:
             case OpCode.Nop:
                 instructions.Add(CilOpCodes.Nop);
@@ -445,6 +460,8 @@ public static class IlGenerator
                 break;
 
             case OpCode.Phi:
+                instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Phi opcodes should not exist at this point in decompilation ({instruction})"));
+                instructions.Add(CilOpCodes.Call, writeLine);
                 if (instruction.Operands.Count > 0 && instruction.Operands[0] is LocalVariable phiDest)
                 {
                     if (instruction.Operands.Count > 1)
@@ -478,6 +495,8 @@ public static class IlGenerator
                 {
                     if (instruction.Operands[0] is Immediate targetAddress)
                     {
+                        instructions.Add(CilOpCodes.Ldstr, $"Method not found @{targetAddress.UnsignedValue:X}");
+                        instructions.Add(CilOpCodes.Call, writeLine);
                         if (instruction.OpCode == OpCode.Call && instruction.Operands.Count > 1 && instruction.Operands[1] is LocalVariable retLocal)
                         {
                             PushDefaultOf(retLocal.Type ?? context.AppContext.SystemTypes.SystemObjectType, method, instructions);
@@ -539,6 +558,8 @@ public static class IlGenerator
                     }
                     else
                     {
+                        instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Unknown call target operand: {instruction.Operands[0]}"));
+                        instructions.Add(CilOpCodes.Call, writeLine);
                         // Any remaining unknown target operand: safely provide default return value
                         if (instruction.OpCode == OpCode.Call && instruction.Operands.Count > 1 && instruction.Operands[1] is LocalVariable retLocal)
                         {
@@ -562,6 +583,8 @@ public static class IlGenerator
                         LoadOperand(instruction.Operands[thisParamIndex], method, locals, writeLine, targetMethod.DeclaringType);
                     else
                     {
+                        instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Non static method called without 'this' param ({instruction})"));
+                        instructions.Add(CilOpCodes.Call, writeLine);
                         instructions.Add(CilOpCodes.Ldnull);
                     }
                 }
@@ -597,6 +620,8 @@ public static class IlGenerator
                 break;
 
             case OpCode.IndirectCall:
+                instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Indirect call: {instruction.Operands[0]} (should have been resolved before IL gen)"));
+                instructions.Add(CilOpCodes.Call, writeLine);
                 if (instruction.Operands.Count > 1 && instruction.Operands[1] is LocalVariable indirectRet)
                 {
                     PushDefaultOf(indirectRet.Type ?? context.AppContext.SystemTypes.SystemObjectType, method, instructions);
@@ -625,12 +650,16 @@ public static class IlGenerator
                 break;
 
             case OpCode.IndirectJump:
+                instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Indirect jump: {instruction.Operands[0]} (should have been resolved before IL gen)"));
+                instructions.Add(CilOpCodes.Call, writeLine);
                 if (!context.IsVoid)
                     PushDefaultOf(context.ReturnType, method, instructions);
                 instructions.Add(CilOpCodes.Ret);
                 break;
 
             case OpCode.ShiftStack:
+                instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Stack shift: {instruction} (stack analysis should have removed these)"));
+                instructions.Add(CilOpCodes.Call, writeLine);
                 break;
 
             case OpCode.CheckEqual:
@@ -749,6 +778,8 @@ public static class IlGenerator
                 break;
 
             default:
+                instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Unknown instruction: {instruction}"));
+                instructions.Add(CilOpCodes.Call, writeLine);
                 break;
         }
 
@@ -994,6 +1025,8 @@ public static class IlGenerator
                     break;
                 }
 
+                instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unmanaged memory load: " + operand));
+                instructions.Add(CilOpCodes.Call, writeLine);
                 if (expectedType != null)
                 {
                     PushDefaultOf(expectedType, method, instructions);
@@ -1064,6 +1097,8 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Call, typeFromHandle);
                 break;
             default:
+                instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unknown operand: " + operand));
+                instructions.Add(CilOpCodes.Call, writeLine);
                 if (expectedType != null)
                     PushDefaultOf(expectedType, method, instructions);
                 else
@@ -1332,6 +1367,8 @@ public static class IlGenerator
                 break;
 
             default:
+                instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Store into unknown operand: {operand}"));
+                instructions.Add(CilOpCodes.Call, writeLine);
                 instructions.Add(CilOpCodes.Pop);
                 break;
         }
